@@ -1,23 +1,31 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+"""
+This script is based on code from Inversecooking by Facebook
+"""
+
+import os
+import pickle
+import random
+import json
+import lmdb
+import nltk
+import logging
+from typing import Dict
+
+import numpy as np
+import pandas as pd
+from PIL import Image
 
 import torch
 import torchvision.transforms as transforms
 import torch.utils.data as data
-import os
-import pickle
-import numpy as np
-import nltk
-from PIL import Image
-from data.utils import Vocabulary
-import random
-import json
-import lmdb
 from torch.utils.data import Dataset
-from typing import Dict
-import pandas as pd
+
 from datasets import Features, Value, Array3D, Sequence
 from datasets import Dataset as hf_Dataset
 from transformers import DataCollatorWithPadding
+
+from data.utils import Vocabulary
 
 class Recipe1MDataset(Dataset):
     """
@@ -48,13 +56,7 @@ class Recipe1MDataset(Dataset):
             random.shuffle(self.ids)
             self.ids = self.ids[:max_num_samples]
 
-    
-    # def get_instrs_vocab(self):
-    #     return self.instrs_vocab
 
-    # def get_instrs_vocab_size(self):
-    #     return len(self.instrs_vocab)
-    
     def get_ingrs_vocab(self):
         return [min(w, key=len) if not isinstance(w, str) else w for w in
                 self.ingrs_vocab.idx2word.values()]  # includes 'pad' ingredient
@@ -97,7 +99,7 @@ class Recipe1MDataset(Dataset):
             # print ("Image recipe_id not found in lmdb. Loading jpeg file...")
             # image = Image.open(os.path.join(self.root, path[0], path[1],
             #                                 path[2], path[3], path)).convert('RGB')
-            print("Not able to load lmdb file")
+            logging.info("Not able to load lmdb file")
             pixel_values = None
 
         # idx = index
@@ -141,14 +143,14 @@ class Recipe1MDataset(Dataset):
 
         question = 'Question: What are the ingredients I need to make this food? Answer:'
         # text_input = self.processor(text=question)
-        # qformer_input = self.qformer_tokenizer(question) ## TODO padding
+        # qformer_input = self.qformer_tokenizer(question)
         # qformer_input_ids = text_input.qformer_input_ids
         # qformer_attention_mask = text_input.qformer_attention_mask
         # input_ids = text_input.input_ids
         # attention_mask = text_input.input_ids
 
         ### TODO
-        # llm_input = self.llm_tokenizer(question) ## TODO padding
+        # llm_input = self.llm_tokenizer(question)
         # input_ids = llm_input.input_ids
         # attention_mask = llm_input.attention_mask
         ####
@@ -236,7 +238,7 @@ def recipe1m_generator(processor, data_dir, split, max_num_labels, max_num_sampl
 
 
 
-def load_datasets(batch_size, processor, data_dir, training_samples=-1, max_num_labels=20, pre_map=False, decoder_only=False) -> Dict[str, hf_Dataset]:
+def load_datasets(processor, data_dir, training_samples=-1, eval_samples=-1, max_num_labels=20, pre_map=False, decoder_only=False) -> Dict[str, hf_Dataset]:
     '''
     :param data_dir: recipe1M dataset directory containing 
         1. lmdb dir (lmdb_train, lmdb_val, lmdb_train)
@@ -247,10 +249,10 @@ def load_datasets(batch_size, processor, data_dir, training_samples=-1, max_num_
     Limits the number of validation and test samples to 1500
     '''
     if not pre_map:
-        print('batches of data are processed on-the-fly')
+        logging.info('batches of data are processed on-the-fly')
 
     if training_samples != -1:
-        print("Limiting the number of training samples to ", training_samples)
+        logging.info(f"Limiting the number of training samples to {training_samples}")
     
     def process_data(example):
         # processor.tokenizer.padding_side = 'right'
@@ -260,7 +262,9 @@ def load_datasets(batch_size, processor, data_dir, training_samples=-1, max_num_
         prompt = processor(
             images=np.array(example['image']),
             text=example['text_input'],
-            return_tensors='pt'
+            return_tensors='pt',
+            truncation=True,
+            padding=False,
         )
 
         output = processor(
@@ -268,6 +272,7 @@ def load_datasets(batch_size, processor, data_dir, training_samples=-1, max_num_
             padding='max_length',
             max_length=128,
             truncation=True,
+            # padding=False,
             return_tensors='pt') # ingredient list
 
         sample['pixel_values'] = prompt.pixel_values
@@ -281,6 +286,7 @@ def load_datasets(batch_size, processor, data_dir, training_samples=-1, max_num_
                 padding='max_length',
                 max_length=128,
                 truncation=True,
+                # padding=False,
                 return_tensors='pt',
             )
 
@@ -308,7 +314,7 @@ def load_datasets(batch_size, processor, data_dir, training_samples=-1, max_num_
     })
 
     for split in ['train', 'val', 'test']:
-        max_num_samples = 1500 if split in ['val', 'test'] else training_samples
+        max_num_samples = eval_samples if split in ['val', 'test'] else training_samples
 
         # Define a lambda function that includes the arguments
         generator_function = lambda split=split, max_num_samples=max_num_samples: recipe1m_generator(
@@ -324,11 +330,48 @@ def load_datasets(batch_size, processor, data_dir, training_samples=-1, max_num_
             features = features,
         )
         if pre_map:
-            datasets[split] = gen_dataset.map(process_data, batched=True, batch_size=batch_size)
+            datasets[split] = gen_dataset.map(process_data, batched=True)
         else:
             datasets[split] = gen_dataset
 
     del gen_dataset
+
+    return datasets
+
+
+class CustomDataCollator:
+    def __init__(self, processor, decoder_only):
+        self.qformer_data_collator = DataCollatorWithPadding(processor.qformer_tokenizer)
+        self.llm_data_collator = DataCollatorWithPadding(processor.tokenizer)
+        self.decoder_only = decoder_only
+    
+    def __call__(self, examples):
+        examples['qformer_input_ids'] = self.qformer_data_collator(examples['qformer_input_ids'])
+        examples['qformer_attention_mask'] = self.qformer_data_collator(examples['qformer_attention_mask'])
+        examples['input_ids'] = self.llm_data_collator(examples['input_ids'])
+        examples['attention_mask'] = self.llm_data_collator(examples['attention_mask'])
+
+        if not self.decoder_only:
+            examples['decoder_input_ids'] = self.llm_data_collator(examples['decoder_input_ids'])
+            examples['decoder_attention_mask'] = self.llm_data_collator(examples['decoder_attention_mask'])
+        
+        return examples
+
+def load_datasets_for_distributed(processor, data_dir, rank, world_size, training_samples=-1, max_num_labels=20, pre_map=False, decoder_only=False):
+    
+    datasets = load_datasets(processor, data_dir, training_samples, max_num_labels, pre_map, decoder_only)
+
+    for split in datasets.keys():
+        # Calculate start and end indices for each process
+        dataset = datasets[split]
+        total_size = len(dataset)
+        per_process_size = total_size // world_size
+        start = rank * per_process_size
+        end = start + per_process_size if rank != world_size - 1 else total_size
+
+        # Slice the dataset for the current process
+        datasets[split] = dataset.select(range(start, end))
+        logging.info(f"* Size of {split} dataset for each processor: {len(datasets[split])}")
 
     return datasets
 
